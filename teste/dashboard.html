@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Painel de Controle da Casa</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"
+    crossorigin="anonymous" referrerpolicy="no-referrer" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/mqtt/4.3.7/mqtt.min.js"></script>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 0;
+      background-color: #f5f5f5;
+      color: #333;
+    }
+
+    h1 {
+      text-align: center;
+      margin-top: 20px;
+      font-size: 2rem;
+    }
+
+    .container {
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+
+    .status-card {
+      background-color: #fff;
+      border-radius: 8px;
+      box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+      padding: 20px;
+      margin-bottom: 20px;
+    }
+
+    .status-card h2 {
+      margin-top: 0;
+    }
+
+    .status {
+      font-weight: bold;
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+
+    .status.on {
+      background-color: #d4edda;
+      color: #155724;
+    }
+
+    .status.off {
+      background-color: #f8d7da;
+      color: #721c24;
+    }
+
+    .status.unknown {
+      background-color:#9e9e9e ;
+      color: #000000;
+    }
+
+    .status.ok {
+      background-color: #d4edda;
+      color: #155724;
+    }
+
+    .status.alert {
+      background-color: #f8d7da;
+      color: #721c24;
+    }
+
+    /* Ícones de conexão ESP */
+    .icon-gray {
+      color: #6c757d;
+    }
+
+    .icon-green {
+      color: #28a745;
+    }
+
+    .status-card i {
+      margin-right: 6px;
+    }
+
+    /* Sobreposição para alerta de fumaça */
+    #alert-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background-color: rgba(0, 0, 0, 0.7);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 9999;
+    }
+
+    .hidden {
+      display: none;
+    }
+
+    .alert-box {
+      background-color: #fff;
+      padding: 30px 40px;
+      border-radius: 8px;
+      text-align: center;
+      box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+    }
+
+    .alert-box h2 {
+      color: #dc3545;
+      margin-top: 0;
+      font-size: 2rem;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>Painel de Monitoramento</h1>
+  <div class="container">
+    <div class="status-card">
+      <h2>Dispositivo&nbsp;1 – Luz &amp; Cortina</h2>
+      <p><i id="esp1-icon" class="fa-solid fa-microchip icon-gray"></i> Conexão:
+        <span id="esp1-conn" class="status off">Desconectado</span>
+      </p>
+      <p><i class="fa-regular fa-lightbulb"></i> Luz:
+        <span id="light-status" class="status unknown">Desconhecido</span>
+      </p>
+      <p><i class="fa-solid fa-window-maximize"></i> Cortina:
+        <span id="curtain-status" class="status unknown">Desconhecido</span>
+      </p>
+    </div>
+    <div class="status-card">
+      <h2>Dispositivo&nbsp;2 – Fumaça</h2>
+      <p><i id="esp2-icon" class="fa-solid fa-microchip icon-gray"></i> Conexão:
+        <span id="esp2-conn" class="status off">Desconectado</span>
+      </p>
+      <p><i class="fa-solid fa-fire-extinguisher"></i> Fumaça:
+        <span id="smoke-status" class="status unknown">Desconhecido</span>
+      </p>
+    </div>
+  </div>
+
+  <!-- Sobreposição de alerta para detecção de fumaça -->
+  <div id="alert-overlay" style="display: none;">
+    <div class="alert-box">
+      <h2>Alerta de Fumaça!</h2>
+      <p>Fumaça detectada. Verifique imediatamente.</p>
+    </div>
+  </div>
+
+  <script>
+    let hasSmokeReading = false
+    var esp1_connected = false
+    var esp2_connected = false
+    const brokerUrl = 'ws://192.168.1.20:9001'
+    const options = {
+      clientId: 'web_dashboard_' + Math.random().toString(16).substr(2, 8),
+      // mantenha clean: true para sessões temporárias. Ajuste se necessário.
+      clean: true
+    }
+
+    // Armazenar o momento da última mensagem de status de cada dispositivo
+    let lastSeen = {
+      esp1: 0,
+      esp2: 0
+    }
+    const pingInterval = 5000 // 5 segundos
+
+    // Conecta ao broker
+    const client = mqtt.connect(brokerUrl, options)
+
+    client.on('connect', function () {
+      console.log('Conectado ao broker MQTT')
+      // Inscreve-se nos tópicos relevantes
+      
+      client.subscribe('home/status/esp1')
+      client.subscribe('home/status/esp2')
+      setInterval(function () {
+        client.publish('home/ping', 'ping')
+        
+      }, pingInterval)
+    })
+
+    client.on('reconnect', function () {
+      console.log('Reconectando ao broker MQTT...')
+    })
+
+    client.on('error', function (error) {
+      console.error('Erro de conexão MQTT:', error)
+    })
+
+    client.on('message', function (topic, message) {
+      const payload = message.toString()
+      
+      // Atualiza cada campo conforme o tópico recebido
+      switch (topic) {
+        case 'home/light':
+          
+          updateLightStatus(payload)
+          break
+        case 'home/curtain':
+          updateCurtainStatus(payload)
+          break
+        case 'home/smoke':
+          updateSmokeStatus(payload)
+          break
+        case 'home/status/esp1':
+          lastSeen.esp1 = Date.now()
+          break
+        case 'home/status/esp2':
+          lastSeen.esp2 = Date.now()
+          break
+        default:
+          console.log('Mensagem não tratada:', topic, payload)
+      }
+    })
+
+    // Funções que atualizam a interface de acordo com o valor recebido
+    function updateLightStatus(value) {
+      
+      const el = document.getElementById('light-status')
+      const val = value.toString().toLowerCase()
+      if(!esp1_connected)
+        return false
+      if (val === 'on' || val === '1' || val === 'acesa') {
+        el.textContent = 'Acesa'
+        el.className = 'status on'
+      } else if (val === 'off' || val === '0' || val === 'apagada') {
+        el.textContent = 'Apagada'
+        el.className = 'status off'
+      } else {
+        el.textContent = value
+        el.className = 'status'
+      }
+    }
+
+    function updateCurtainStatus(value) {
+      const el = document.getElementById('curtain-status')
+      const val = value.toString().toLowerCase()
+      if(!esp1_connected)
+        return false
+      if (val === 'open' || val === '1' || val === 'aberta') {
+        el.textContent = 'Aberta'
+        el.className = 'status on'
+      } else if (val === 'close' || val === '0' || val === 'fechada') {
+        el.textContent = 'Fechada'
+        el.className = 'status off'
+      } else {
+        el.textContent = value
+        el.className = 'status'
+      }
+    }
+
+    function updateSmokeStatus(value) {
+      const el = document.getElementById('smoke-status')
+      const overlay = document.getElementById('alert-overlay')
+      const val = String(value).trim().toLowerCase()
+      
+      // valores que contam como "fumaça detectada"
+      const smokeDetected = (val === '1' || val === 'fumaça' || val === 'smoke' || val === 'true')
+      debugger
+      hasSmokeReading = true
+      if(!esp2_connected)
+        return false
+      if (smokeDetected) {
+        el.textContent = 'FUMAÇA!'
+        el.className = 'status alert'
+        
+        overlay.style.display ="flex"
+      } else {
+        el.textContent = 'OK'
+        el.className = 'status ok'
+        overlay.style.display ="none"
+      }
+    }
+
+    // Atualiza o status de conexão a cada 5 segundos com base na última mensagem de status recebida
+    setInterval(function () {
+      const now = Date.now()
+      const conn1El = document.getElementById('esp1-conn')
+      const conn2El = document.getElementById('esp2-conn')
+      const icon1 = document.getElementById('esp1-icon')
+      const icon2 = document.getElementById('esp2-icon')
+      const el_smoke = document.getElementById('smoke-status')
+      const el_curtain = document.getElementById('curtain-status')
+      const el_light = document.getElementById('light-status')
+      // Atualiza o dispositivo 1
+      if (now - lastSeen.esp1 < pingInterval * 1.5) {
+        if(!esp1_connected){
+          client.subscribe('home/light')
+          client.subscribe('home/curtain')
+        }
+        conn1El.textContent = 'Conectado'
+        conn1El.className = 'status on'
+        icon1.classList.remove('icon-gray')
+        icon1.classList.add('icon-green')
+        esp1_connected=true
+      } else {
+        
+        conn1El.textContent = 'Desconectado'
+        conn1El.className = 'status off'
+        icon1.classList.remove('icon-green')
+        icon1.classList.add('icon-gray')
+
+        el_curtain.textContent = "Desconhecido"
+        el_curtain.className = 'status unknown'
+
+        el_light.textContent = "Desconhecido"
+        el_light.className = 'status unknown'
+        esp1_connected=false
+        
+      }
+      // Atualiza o dispositivo 2
+      if (now - lastSeen.esp2 < pingInterval * 1.5) {
+        if(!esp2_connected)
+          client.subscribe('home/smoke')         
+        conn2El.textContent = 'Conectado'
+        conn2El.className = 'status on'
+        icon2.classList.remove('icon-gray')
+        icon2.classList.add('icon-green')
+        esp2_connected=true
+      } else {
+        
+        
+        conn2El.textContent = 'Desconectado'
+        conn2El.className = 'status off'
+        icon2.classList.remove('icon-green')
+        icon2.classList.add('icon-gray')
+        el_smoke.textContent = "Desconhecido"
+        el_smoke.className = 'status unknown'
+        esp2_connected=false
+      }
+    }, pingInterval)
+  </script>
+</body>
+
+</html>
