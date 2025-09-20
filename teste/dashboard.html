@@ -4,7 +4,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Painel de Controle da Casa</title>
+  <title>Dashboard da casa inteligente</title>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"
     crossorigin="anonymous" referrerpolicy="no-referrer" />
   <script src="https://cdnjs.cloudflare.com/ajax/libs/mqtt/4.3.7/mqtt.min.js"></script>
@@ -120,10 +120,10 @@
 </head>
 
 <body>
-  <h1>Painel de Monitoramento</h1>
+  <h1>Dasboard e Gerenciador da Casa Inteligente</h1>
   <div class="container">
     <div class="status-card">
-      <h2>Dispositivo&nbsp;1 – Luz &amp; Cortina</h2>
+      <h2>Sistema de iluminação</h2>
       <p><i id="esp1-icon" class="fa-solid fa-microchip icon-gray"></i> Conexão:
         <span id="esp1-conn" class="status off">Desconectado</span>
       </p>
@@ -133,12 +133,14 @@
       <p><i class="fa-solid fa-window-maximize"></i> Cortina:
         <span id="curtain-status" class="status unknown">Desconhecido</span>
       </p>
+      <p>
+        <i class="fa fa-male" aria-hidden="true"></i>Presença
+        <span id="pres-status" class="status unknown">Desconhecido</span>
+      </p>
     </div>
     <div class="status-card">
-      <h2>Dispositivo&nbsp;2 – Fumaça</h2>
-      <p><i id="esp2-icon" class="fa-solid fa-microchip icon-gray"></i> Conexão:
-        <span id="esp2-conn" class="status off">Desconectado</span>
-      </p>
+      <h2>Sistema de Segurança</h2>
+ 
       <p><i class="fa-solid fa-fire-extinguisher"></i> Fumaça:
         <span id="smoke-status" class="status unknown">Desconhecido</span>
       </p>
@@ -157,7 +159,7 @@
     let hasSmokeReading = false
     var esp1_connected = false
     var esp2_connected = false
-    const brokerUrl = 'ws://192.168.1.20:9001'
+    const brokerUrl = 'ws://192.168.121.160:9001'
     const options = {
       clientId: 'web_dashboard_' + Math.random().toString(16).substr(2, 8),
       // mantenha clean: true para sessões temporárias. Ajuste se necessário.
@@ -209,6 +211,9 @@
         case 'home/smoke':
           updateSmokeStatus(payload)
           break
+        case 'home/pres':
+          updatePresStatus(payload)
+          break
         case 'home/status/esp1':
           lastSeen.esp1 = Date.now()
           break
@@ -247,8 +252,26 @@
       if (val === 'open' || val === '1' || val === 'aberta') {
         el.textContent = 'Aberta'
         el.className = 'status on'
-      } else if (val === 'close' || val === '0' || val === 'fechada') {
+      } else if (val === 'closed' || val === '0' || val === 'fechada') {
         el.textContent = 'Fechada'
+        el.className = 'status off'
+      } else {
+        el.textContent = value
+        el.className = 'status'
+      }
+    }
+
+    function updatePresStatus(value) {
+      const el = document.getElementById('pres-status')
+      const val = value.toString().toLowerCase()
+      if(!esp1_connected)
+        return false
+      debugger
+      if (val === 'sim' || val === '1' || val === 'aberta') {
+        el.textContent = 'Sim'
+        el.className = 'status on'
+      } else if (val === 'nao' || val === '0' || val === 'fechada') {
+        el.textContent = 'Não'
         el.className = 'status off'
       } else {
         el.textContent = value
@@ -283,23 +306,26 @@
     setInterval(function () {
       const now = Date.now()
       const conn1El = document.getElementById('esp1-conn')
-      const conn2El = document.getElementById('esp2-conn')
       const icon1 = document.getElementById('esp1-icon')
-      const icon2 = document.getElementById('esp2-icon')
       const el_smoke = document.getElementById('smoke-status')
       const el_curtain = document.getElementById('curtain-status')
       const el_light = document.getElementById('light-status')
+      const el_pres = document.getElementById('pres-status')
       // Atualiza o dispositivo 1
       if (now - lastSeen.esp1 < pingInterval * 1.5) {
         if(!esp1_connected){
           client.subscribe('home/light')
           client.subscribe('home/curtain')
+          client.subscribe('home/smoke')   
+          client.subscribe('home/pres')   
+          
         }
         conn1El.textContent = 'Conectado'
         conn1El.className = 'status on'
         icon1.classList.remove('icon-gray')
         icon1.classList.add('icon-green')
         esp1_connected=true
+        esp2_connected=true
       } else {
         
         conn1El.textContent = 'Desconectado'
@@ -313,27 +339,13 @@
         el_light.textContent = "Desconhecido"
         el_light.className = 'status unknown'
         esp1_connected=false
-        
-      }
-      // Atualiza o dispositivo 2
-      if (now - lastSeen.esp2 < pingInterval * 1.5) {
-        if(!esp2_connected)
-          client.subscribe('home/smoke')         
-        conn2El.textContent = 'Conectado'
-        conn2El.className = 'status on'
-        icon2.classList.remove('icon-gray')
-        icon2.classList.add('icon-green')
-        esp2_connected=true
-      } else {
-        
-        
-        conn2El.textContent = 'Desconectado'
-        conn2El.className = 'status off'
-        icon2.classList.remove('icon-green')
-        icon2.classList.add('icon-gray')
+
         el_smoke.textContent = "Desconhecido"
         el_smoke.className = 'status unknown'
         esp2_connected=false
+        
+        el_pres.textContent = "Desconhecido"
+        el_pres.className = 'status unknown'
       }
     }, pingInterval)
   </script>

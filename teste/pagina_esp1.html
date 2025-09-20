@@ -40,6 +40,16 @@
     <button id="btnCurtainOpen">open (retido)</button>
     <button id="btnCurtainClose">close (retido)</button>
   </div>
+  <div class="row">
+    Presença:
+    <button id="btnPresOpen">Sem ngm</button>
+    <button id="btnPresClose">Algm entrou</button>
+  </div>
+  <div class="row">
+    <legend>Publicar fumaça</legend>
+    <button id="btnSmoke0">0 (sem fumaça)</button>
+    <button id="btnSmoke1">1 (detectar fumaça)</button>
+  </div>
 </fieldset>
 
 <fieldset>
@@ -53,12 +63,14 @@
 
 <script>
   // ===== CONFIG =====
-  const BROKER_URL = 'ws://192.168.1.20:9001'; // ajuste se usar /mqtt
+  const BROKER_URL = 'ws://192.168.121.160:9001'; // ajuste se usar /mqtt
   const CLIENT_ID = 'esp1_sim_' + Math.random().toString(16).slice(2);
   const TOPICS = {
     ping:     'home/ping',
     alive:    'home/status/esp1',
     light:    'home/light',
+    smoke:    'home/smoke',
+    pres:    'home/pres',
     curtain:  'home/curtain'
   };
 
@@ -104,6 +116,12 @@
   });
 
   // ===== Ações =====
+  document.getElementById('btnSmoke0').onclick = () => {
+    client.publish(TOPICS.smoke, '0');
+  };
+  document.getElementById('btnSmoke1').onclick = () => {
+    client.publish(TOPICS.smoke, '1');
+  };
   document.getElementById('btnLightOn').onclick = () => {
     client.publish(TOPICS.light, 'on', { retain: true });
   };
@@ -114,7 +132,14 @@
     client.publish(TOPICS.curtain, 'open', { retain: true });
   };
   document.getElementById('btnCurtainClose').onclick = () => {
-    client.publish(TOPICS.curtain, 'close', { retain: true });
+    client.publish(TOPICS.curtain, 'closed', { retain: true });
+  };
+
+  document.getElementById('btnPresOpen').onclick = () => {
+    client.publish(TOPICS.pres, 'NAO', { retain: true });
+  };
+  document.getElementById('btnPresClose').onclick = () => {
+    client.publish(TOPICS.pres, 'SIM', { retain: true });
   };
 
   document.getElementById('btnAliveOnce').onclick = () => {
