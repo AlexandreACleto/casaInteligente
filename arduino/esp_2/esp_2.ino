@@ -1,174 +1,331 @@
+/*
+ * Exemplo de firmware para ESP32 que controla uma luz (LED) e uma cortina (servo).
+ * Além das funcionalidades de sensor de presença e LDR, envia atualizações de
+ * estado via MQTT e responde a pings para sinalizar que está vivo.
+ *
+ * Este código utiliza a biblioteca PubSubClient para comunicação MQTT.
+ * Ajuste as credenciais de Wi‑Fi e do broker MQTT conforme seu ambiente.
+ */
+
 #include <WiFi.h>
-#include <WebServer.h>
 #include <PubSubClient.h>
+#include <ESP32Servo.h>
 
-#define LED_PIN 2
+// =================== MODO DE USO ===================
+// Tinkercad/sim: deixar 1. Hardware real: 0 (usa PIR real em GPIO26).
+#define MODO_TINKERCAD 1
 
-// ===== WIFI =====
-#define WIFI_SSID "."
-#define WIFI_PASS "."
+// -------------------- PINAGEM (ESP32) --------------------
+const int LDR_PIN   = 34;  // ADC1_CH6 (entrada somente)
+const int PIR_PIN   = 26;  // PIR (digital IN)
+const int LED_PIN   = 23;  // LED (sala)
+const int SERVO_PIN = 18;  // Servo (PWM LEDC)
+const int BOTAO_PIN = 19;  // Botão MANUAL (abre/fecha) - INPUT_PULLUP
 
-// ===== MQTT =====
-const char* MQTT_HOST = "172.20.10.4";   // IP do broker (seu PC)
-const uint16_t MQTT_PORT = 1883;
-// Opcional: defina um nome fixo para o dispositivo; se vazio, usa MAC
-#define DEVICE_NAME "Esp-2"
+// -------------------- SERVO --------------------
+const int SERVO_FECHADO  = 5;    // ajuste ao seu hardware
+const int SERVO_ABERTO   = 100;  // ajuste ao seu hardware
+const int SERVO_PASSO    = 1;
+const int SERVO_DELAY_MS = 10;
 
-// ===== HTTP =====
-WebServer server(80);
+const int SERVO_MIN_US = 500;    // ajuste fino conforme servo
+const int SERVO_MAX_US = 2400;   // ~500–2400 µs
 
-// ===== MQTT clients =====
-WiFiClient net;
-PubSubClient mqtt(net);
+// -------------------- LDR --------------------
+const int N_SAMPLES = 10;
+int LIMIAR_CLARO  = 800;  // só muda pra CLARO acima disso
+int LIMIAR_ESCURO = 300;  // só muda pra ESCURO abaixo disso
 
-// Estado
-bool ledState = false;
+// -------------------- PRESENÇA --------------------
+#if MODO_TINKERCAD
+const unsigned long PIR_WARMUP_MS = 0UL;       // sem aquecimento no simulado
+#else
+const unsigned long PIR_WARMUP_MS = 20000UL;   // ~20 s no PIR real
+#endif
+const unsigned long PIR_HOLD_MS   = 15000UL;   // segura presença por 15 s
 
-// IDs/Tópicos dinâmicos
-String deviceId;                // ex.: "A1B2C3"
-char topicCmd[64];              // esp32/<ID>/led/set
-char topicCmdAll[] = "esp32/all/led/set";
-char topicState[64];            // esp32/<ID>/led/state
-char topicStatus[64];           // esp32/<ID>/status
-char mqttClientId[48];          // esp32-led-<ID>
+// -------------------- VARIÁVEIS DE ESTADO --------------------
+Servo janela;
+bool estadoJanelaAberta = false;
+bool estadoLedAceso     = false;
 
-// ---------- Helpers ----------
-String htmlPage() {
-  String stateText = ledState ? "LIGADO" : "DESLIGADO";
-  String color = ledState ? "#16a34a" : "#b91c1c";
-  String buttons = R"(
-<div style="display:flex; gap:12px; margin-top:16px;">
-  <a href="/on"><button style="padding:10px 18px; font-size:16px;">Ligar</button></a>
-  <a href="/off"><button style="padding:10px 18px; font-size:16px;">Desligar</button></a>
-  <a href="/toggle"><button style="padding:10px 18px; font-size:16px;">Alternar</button></a>
-</div>
-)";
-  String html = R"(
-<!doctype html><html lang="pt-br"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><title>ESP32 LED</title></head>
-<body style="font-family:Arial,Helvetica,sans-serif; padding:24px;">
-<h2>ESP32 — Controle do LED interno</h2>
-<p>Dispositivo: <code>)" + deviceId + R"(</code></p>
-<p>Estado atual do LED: <b style="color:)" + color + R"(;">)" + stateText + R"(</b></p>)" + buttons + R"(
-<p style="margin-top:24px; color:#555;">
-Topics individuais: <code>esp32/)" + deviceId + R"(/led/set</code> | <code>esp32/)" + deviceId + R"(/led/state</code><br>
-Broadcast: <code>esp32/all/led/set</code>
-</p></body></html>)";
-  return html;
+unsigned long inicioMs = 0;
+unsigned long ultimoMovimentoMs = 0;  // última detecção de presença efetiva
+
+// LDR média móvel
+int  amostras[N_SAMPLES];
+int  idx = 0;
+long soma = 0;
+
+// Debounce BOTÃO manual
+bool ultimoEstadoBotao = HIGH; // INPUT_PULLUP: solto=HIGH, pressionado=LOW
+unsigned long ultimoTempoBotao = 0;
+const unsigned long debounceMsManual = 50;
+
+// Debounce BOTÃO que simula o PIR (borda)
+int  pirUltimoEstado = HIGH;           // INPUT_PULLUP (no sim)
+unsigned long pirUltimaMudanca = 0;
+const unsigned long debounceMsPIR = 40;
+
+// Controle manual x automático
+bool controleManual = false;
+unsigned long tempoUltimoBotaoManual = 0;
+const unsigned long TEMPO_BLOQUEIO_AUTOMATICO = 7000; // 7 s após botão manual
+
+// -------------------- Wi‑Fi e MQTT --------------------
+const char* ssid       = "YOUR_WIFI_SSID";
+const char* password   = "YOUR_WIFI_PASSWORD";
+const char* mqttServer = "YOUR_MQTT_BROKER"; // exemplo: "broker.hivemq.com"
+const int   mqttPort   = 1883;                // porta padrão MQTT sem TLS
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+unsigned long ultimoStatusMs = 0;
+const unsigned long INTERVALO_STATUS_MS = 20000; // 20 s
+
+// -------------------- AUXILIARES --------------------
+int mediaLdr() { return (int)(soma / N_SAMPLES); }
+
+void adicionarAmostra(int valor) {
+  soma -= amostras[idx];
+  amostras[idx] = valor;
+  soma += valor;
+  idx = (idx + 1) % N_SAMPLES;
 }
 
-void publishState() {
-  mqtt.publish(topicState, ledState ? "ON" : "OFF", true);
-}
-
-void setLed(bool on) {
-  ledState = on;
-  digitalWrite(LED_PIN, on ? HIGH : LOW);
-  if (mqtt.connected()) publishState();
-}
-
-bool parseOnOff(const char* payload) {
-  String p(payload); p.toUpperCase();
-  if (p == "ON" || p == "1")  return true;
-  if (p == "OFF" || p == "0") return false;
-  return ledState;
-}
-
-// ---------- HTTP ----------
-void handleRoot()    { server.send(200, "text/html", htmlPage()); }
-void handleOn()      { setLed(true);  server.send(200, "text/html", htmlPage()); }
-void handleOff()     { setLed(false); server.send(200, "text/html", htmlPage()); }
-void handleToggle()  { setLed(!ledState); server.send(200, "text/html", htmlPage()); }
-void handleNotFound(){ server.send(404, "text/plain", "Use /, /on, /off ou /toggle"); }
-
-// ---------- Wi-Fi ----------
-void connectWiFi() {
-  Serial.printf("Conectando a %s\n", WIFI_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  unsigned long t0 = millis();
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500); Serial.print(".");
-    if (millis() - t0 > 20000) { Serial.println("\nWiFi FAIL. Reiniciando..."); delay(2000); ESP.restart(); }
+void moverServoSuave(int fromAngle, int toAngle) {
+  if (fromAngle == toAngle) return;
+  int passo = (toAngle > fromAngle) ? SERVO_PASSO : -SERVO_PASSO;
+  for (int a = fromAngle; (passo > 0) ? (a <= toAngle) : (a >= toAngle); a += passo) {
+    janela.write(a);
+    delay(SERVO_DELAY_MS);
   }
-  Serial.printf("\nWiFi OK. IP: %s\n", WiFi.localIP().toString().c_str());
 }
 
-// ---------- ID/Topics ----------
-String getDeviceId() {
-  if (String(DEVICE_NAME).length() > 0) return String(DEVICE_NAME);
-  String mac = WiFi.macAddress(); // "AA:BB:CC:DD:EE:FF"
-  mac.replace(":", "");
-  String id = mac.substring(6);   // últimos 6 hex -> "DDEEFF"
-  id.toUpperCase();
-  return id;
+void abrirJanela() {
+  if (!estadoJanelaAberta) {
+    moverServoSuave(SERVO_FECHADO, SERVO_ABERTO);
+    estadoJanelaAberta = true;
+    Serial.println(F("[ACAO] Janela ABERTA"));
+  }
 }
 
-void buildTopics() {
-  snprintf(topicCmd,   sizeof(topicCmd),   "esp32/%s/led/set",   deviceId.c_str());
-  snprintf(topicState, sizeof(topicState), "esp32/%s/led/state", deviceId.c_str());
-  snprintf(topicStatus,sizeof(topicStatus),"esp32/%s/status",    deviceId.c_str());
-  snprintf(mqttClientId,sizeof(mqttClientId),"esp32-led-%s",     deviceId.c_str());
-  Serial.printf("Topics:\n  CMD:   %s\n  STATE: %s\n  LWT:   %s\n", topicCmd, topicState, topicStatus);
+void fecharJanela() {
+  if (estadoJanelaAberta) {
+    moverServoSuave(SERVO_ABERTO, SERVO_FECHADO);
+    estadoJanelaAberta = false;
+    Serial.println(F("[ACAO] Janela FECHADA"));
+  }
 }
 
-// ---------- MQTT ----------
+void ligarLed() {
+  if (!estadoLedAceso) {
+    digitalWrite(LED_PIN, HIGH);
+    estadoLedAceso = true;
+    Serial.println(F("[ACAO] LED LIGADO (escuro)"));
+  }
+}
+
+void desligarLed() {
+  if (estadoLedAceso) {
+    digitalWrite(LED_PIN, LOW);
+    estadoLedAceso = false;
+    Serial.println(F("[ACAO] LED DESLIGADO (claro)"));
+  }
+}
+
+// -------------------- MQTT callback --------------------
+// Trata mensagens recebidas. Neste exemplo, respondemos a pings publicados pelo dashboard.
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  static char buf[64];
-  length = min(length, (unsigned int)(sizeof(buf) - 1));
-  memcpy(buf, payload, length); buf[length] = '\0';
-
-  // Aceita comando se veio do seu tópico individual OU do broadcast
-  if (strcmp(topic, topicCmd) == 0 || strcmp(topic, topicCmdAll) == 0) {
-    String p(buf); p.toUpperCase();
-    if (p == "TOGGLE") setLed(!ledState);
-    else               setLed(parseOnOff(buf));
+  String topico = String(topic);
+  String mensagem;
+  for (unsigned int i = 0; i < length; i++) {
+    mensagem += (char)payload[i];
   }
+  Serial.print("[MQTT] Mensagem recebida em ");
+  Serial.print(topico);
+  Serial.print(": ");
+  Serial.println(mensagem);
+  // Se recebermos um ping, respondemos com um status para sinalizar que estamos conectados
+  if (topico == "home/ping") {
+    client.publish("home/status/esp1", "alive");
+  }
+  // Poderia adicionar mais comandos (ex.: forçar abrir/fechar cortina via MQTT)
 }
 
-void connectMQTT() {
-  mqtt.setServer(MQTT_HOST, MQTT_PORT);
-  mqtt.setCallback(mqttCallback);
-
-  while (!mqtt.connected()) {
-    Serial.print("MQTT conectando...");
-    if (mqtt.connect(mqttClientId, topicStatus, 0, true, "offline")) {
-      Serial.println("OK");
-      mqtt.publish(topicStatus, "online", true);
-      mqtt.subscribe(topicCmd);
-      mqtt.subscribe(topicCmdAll);
-      publishState();
+// Conecta/reconecta ao broker MQTT
+void reconnectMQTT() {
+  // Fica em loop até conectar
+  while (!client.connected()) {
+    Serial.print("Conectando ao broker MQTT...");
+    String clientId = "esp32_light_curtain_";
+    clientId += String(random(0xffff), HEX);
+    if (client.connect(clientId.c_str())) {
+      Serial.println("conectado");
+      // Inscreve-se no tópico de ping para responder à página web
+      client.subscribe("home/ping");
     } else {
-      Serial.printf("fail rc=%d\n", mqtt.state());
-      delay(1000);
+      Serial.print("falha, rc=");
+      Serial.print(client.state());
+      Serial.println(" tentando novamente em 5s");
+      delay(5000);
     }
   }
 }
 
-// ---------- Setup/Loop ----------
-void setup() {
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
-  Serial.begin(115200);
-  delay(150);
-
-  connectWiFi();
-  deviceId = getDeviceId();
-  buildTopics();
-  connectMQTT();
-
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/on", HTTP_GET, handleOn);
-  server.on("/off", HTTP_GET, handleOff);
-  server.on("/toggle", HTTP_GET, handleToggle);
-  server.onNotFound(handleNotFound);
-  server.begin();
-  Serial.println("HTTP pronto.");
+// Conecta ao Wi‑Fi
+void setupWifi() {
+  delay(10);
+  Serial.println();
+  Serial.print("Conectando em ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.println("WiFi conectado");
+  Serial.print("Endereço IP: ");
+  Serial.println(WiFi.localIP());
 }
 
+// -------------------- SETUP --------------------
+void setup() {
+  Serial.begin(115200);
+
+#if MODO_TINKERCAD
+  pinMode(PIR_PIN, INPUT_PULLUP);  // botão simulando PIR
+#else
+  pinMode(PIR_PIN, INPUT);         // saída digital do PIR real
+#endif
+
+  pinMode(BOTAO_PIN, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  // ---- SERVO (ESP32) ----
+  janela.setPeriodHertz(50); // 50 Hz
+  janela.attach(SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
+  janela.write(SERVO_FECHADO);
+
+  // ---- ADC (ESP32) ----
+  analogReadResolution(12); // 0..4095
+  analogSetPinAttenuation(LDR_PIN, ADC_11db);
+
+  // Inicializa buffer da média móvel
+  int leitura0 = analogRead(LDR_PIN);
+  for (int i = 0; i < N_SAMPLES; i++) {
+    amostras[i] = leitura0;
+    soma += leitura0;
+  }
+
+  inicioMs = millis();
+  Serial.println(F("Sistema iniciado (ESP32)."));
+#if !MODO_TINKERCAD
+  Serial.println(F("Aguardando aquecimento do PIR real..."));
+#endif
+  // Conecta Wi‑Fi e MQTT
+  setupWifi();
+  client.setServer(mqttServer, mqttPort);
+  client.setCallback(mqttCallback);
+}
+
+// -------------------- LOOP --------------------
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) connectWiFi();
-  if (!mqtt.connected()) connectMQTT();
-  mqtt.loop();
-  server.handleClient();
+  unsigned long agora = millis();
+
+  // Assegura que estamos conectados ao MQTT
+  if (!client.connected()) {
+    reconnectMQTT();
+  }
+  client.loop();
+
+  // ========== 1) BOTÃO MANUAL (abre/fecha) ==========
+  int leituraBotao = digitalRead(BOTAO_PIN);
+  if (leituraBotao != ultimoEstadoBotao && (agora - ultimoTempoBotao) > debounceMsManual) {
+    ultimoTempoBotao = agora;
+    ultimoEstadoBotao = leituraBotao;
+    if (leituraBotao == LOW) { // pressionado
+      if (estadoJanelaAberta) fecharJanela();
+      else abrirJanela();
+      controleManual = true;
+      tempoUltimoBotaoManual = agora;
+    }
+  }
+
+  if (controleManual && (agora - tempoUltimoBotaoManual > TEMPO_BLOQUEIO_AUTOMATICO)) {
+    controleManual = false;
+  }
+
+  // ========== 2) LDR com média móvel + histerese ==========
+  int leitura = analogRead(LDR_PIN);
+  adicionarAmostra(leitura);
+  int luzMedia = mediaLdr();
+  static bool estaClaro = false; // estado com histerese
+  if (!estaClaro && luzMedia >= LIMIAR_CLARO) {
+    estaClaro = true;
+  } else if (estaClaro && luzMedia <= LIMIAR_ESCURO) {
+    estaClaro = false;
+  }
+
+  if (estaClaro) desligarLed();
+  else ligarLed();
+
+  // ========== 3) PRESENÇA (PIR real OU botão simulando) ==========
+#if MODO_TINKERCAD
+  int pirLeitura = digitalRead(PIR_PIN);
+  bool pirPronto = true; // sem warmup
+  if ((pirLeitura != pirUltimoEstado) && (agora - pirUltimaMudanca > debounceMsPIR)) {
+    pirUltimaMudanca = agora;
+    pirUltimoEstado = pirLeitura;
+    if (pirLeitura == LOW) {
+      ultimoMovimentoMs = agora;
+      Serial.println(F("[EVENTO] Presença simulada (botão PIR)"));
+    }
+  }
+#else
+  bool pirPronto = (agora - inicioMs) > PIR_WARMUP_MS;
+  bool pirLeituraReal = (digitalRead(PIR_PIN) == HIGH);
+  if (pirLeituraReal && pirPronto) {
+    ultimoMovimentoMs = agora;
+  }
+#endif
+  bool haPresenca = pirPronto && (agora - ultimoMovimentoMs <= PIR_HOLD_MS);
+
+  // ========== 4) CONTROLE AUTOMÁTICO DA JANELA ==========
+  if (!controleManual) {
+    if (estaClaro && haPresenca) abrirJanela();
+    else                         fecharJanela();
+  }
+
+  // ========== 5) LOG e envio MQTT ==========
+  static unsigned long ultimoLog = 0;
+  if (agora - ultimoLog > 1000) {
+    ultimoLog = agora;
+    Serial.print(F("LDR(avg)=")); Serial.print(luzMedia);
+    Serial.print(F(" | Claro? ")); Serial.print(estaClaro ? "SIM" : "NAO");
+#if MODO_TINKERCAD
+    Serial.print(F(" | PIR(sim)=")); Serial.print((digitalRead(PIR_PIN) == LOW) ? "BTN" : "IDLE");
+#else
+    Serial.print(F(" | PIR(real)=")); Serial.print((digitalRead(PIR_PIN) == HIGH) ? "HIGH" : "LOW");
+#endif
+    Serial.print(F(" | Presenca? ")); Serial.print(haPresenca ? "SIM" : "NAO");
+    Serial.print(F(" | LED=")); Serial.print(estadoLedAceso ? "ON" : "OFF");
+    Serial.print(F(" | Janela=")); Serial.println(estadoJanelaAberta ? "ABERTA" : "FECHADA");
+  }
+
+  // Envia status periodicamente
+  if (agora - ultimoStatusMs > INTERVALO_STATUS_MS) {
+    ultimoStatusMs = agora;
+    // publica que está vivo
+    client.publish("home/status/esp1", "alive");
+    // publica o estado da luz e da cortina
+    client.publish("home/light", estadoLedAceso ? "on" : "off");
+    client.publish("home/curtain", estadoJanelaAberta ? "open" : "closed");
+  }
+
+  // Pequeno atraso para não travar a CPU
+  delay(5);
 }
