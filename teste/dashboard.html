@@ -159,7 +159,7 @@
     let hasSmokeReading = false
     var esp1_connected = false
     var esp2_connected = false
-    const brokerUrl = 'ws://192.168.121.160:9001'
+    const brokerUrl = 'ws://172.20.10.4:9001'
     const options = {
       clientId: 'web_dashboard_' + Math.random().toString(16).substr(2, 8),
       // mantenha clean: true para sessões temporárias. Ajuste se necessário.
@@ -285,11 +285,10 @@
       const val = String(value).trim().toLowerCase()
       
       // valores que contam como "fumaça detectada"
-      const smokeDetected = (val === '1' || val === 'fumaça' || val === 'smoke' || val === 'true')
+      const smokeDetected = !(val === '1' || val === 'gas!' || val === 'gas' || val === 'true')
       debugger
       hasSmokeReading = true
-      if(!esp2_connected)
-        return false
+
       if (smokeDetected) {
         el.textContent = 'FUMAÇA!'
         el.className = 'status alert'
